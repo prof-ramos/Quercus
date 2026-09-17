@@ -1,7 +1,6 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 .Python
 
@@ -22,7 +21,6 @@ dist/
 *.db
 *.sqlite
 *.sqlite3
-!docs/**/*.db
 
 # Editor
 .vscode/
