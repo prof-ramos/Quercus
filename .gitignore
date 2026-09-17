@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Test / build
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# SQLite local
+*.db
+*.sqlite
+*.sqlite3
+!docs/**/*.db
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
