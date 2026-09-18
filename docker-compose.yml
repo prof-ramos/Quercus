@@ -1,0 +1,44 @@
+services:
+  quercus:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quercus-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - QUERCUS_DB_PATH=/app/data/quercus.db
+      - QUERCUS_BACKUP_DIR=/app/backups
+      - QUERCUS_USER_ID=${QUERCUS_USER_ID:-gabriel}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_USER_IDS=${TELEGRAM_ALLOWED_USER_IDS:-}
+    command: ["python", "-m", "quercus", "bot"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Container one-shot para rotina noturna (ou executável via cron do host: docker compose run --rm quercus-nightly)
+  quercus-nightly:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: quercus-nightly
+    restart: "no"
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - QUERCUS_DB_PATH=/app/data/quercus.db
+      - QUERCUS_BACKUP_DIR=/app/backups
+      - QUERCUS_USER_ID=${QUERCUS_USER_ID:-gabriel}
+    command: ["python", "-m", "quercus", "nightly"]

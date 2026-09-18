@@ -1,0 +1,22 @@
+[Unit]
+Description=Quercus - Agente Pessoal para Concursos (Telegram Bot)
+After=network.target
+
+[Service]
+Type=simple
+User=quercus
+Group=quercus
+WorkingDirectory=/opt/quercus
+EnvironmentFile=/opt/quercus/.env
+ExecStart=/opt/quercus/.venv/bin/python -m quercus bot
+Restart=always
+RestartSec=5s
+
+# Hardening / Sandboxing de Segurança
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/quercus/data /opt/quercus/backups
+
+[Install]
+WantedBy=multi-user.target

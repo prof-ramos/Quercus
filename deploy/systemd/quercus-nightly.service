@@ -1,0 +1,17 @@
+[Unit]
+Description=Quercus - Rotina Noturna de Consolidação e Backup Online
+After=network.target
+
+[Service]
+Type=oneshot
+User=quercus
+Group=quercus
+WorkingDirectory=/opt/quercus
+EnvironmentFile=/opt/quercus/.env
+ExecStart=/opt/quercus/.venv/bin/python -m quercus nightly
+
+# Hardening / Sandboxing de Segurança
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/quercus/data /opt/quercus/backups
