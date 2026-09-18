@@ -7,6 +7,9 @@ name = "quercus"
 version = "0.0.1"
 description = "Agente pessoal de preparação para concursos"
 requires-python = ">=3.13"
+dependencies = [
+    "python-telegram-bot>=21",
+]
 
 [project.optional-dependencies]
 dev = [
