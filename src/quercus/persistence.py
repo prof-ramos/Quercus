@@ -7,7 +7,7 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -48,6 +48,22 @@ CREATE TABLE IF NOT EXISTS memory_evidence (
     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
     FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE RESTRICT
 );
+
+CREATE TABLE IF NOT EXISTS study_sessions (
+    id INTEGER PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    topic TEXT,
+    planned_minutes INTEGER NOT NULL,
+    actual_minutes INTEGER,
+    planned_at TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 VALID_SOURCE_TYPES: frozenset[str] = frozenset(
@@ -59,6 +75,16 @@ VALID_SOURCE_TYPES: frozenset[str] = frozenset(
         "DOCUMENT_TRUSTED",
         "DOCUMENT_UNTRUSTED",
         "TOOL_RESULT",
+    }
+)
+
+VALID_SESSION_STATUSES: frozenset[str] = frozenset(
+    {
+        "planned",
+        "completed",
+        "partial",
+        "skipped",
+        "cancelled",
     }
 )
 
@@ -404,3 +430,172 @@ def supersede_memory(
         supersedes_id=old_memory_id,
         created_at=updated_at,
     )
+
+
+def record_study_session(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    subject: str,
+    planned_minutes: int,
+    topic: str | None = None,
+    actual_minutes: int | None = None,
+    planned_at: str | datetime | None = None,
+    started_at: str | datetime | None = None,
+    finished_at: str | datetime | None = None,
+    status: str = "planned",
+    source: str = "USER_EXPLICIT",
+    notes: str | None = None,
+    created_at: str | datetime | None = None,
+) -> int:
+    """Registra uma sessão de estudo planejada ou realizada.
+
+    Retorna o ID da sessão criada.
+    """
+    if status not in VALID_SESSION_STATUSES:
+        allowed = sorted(VALID_SESSION_STATUSES)
+        raise ValueError(f"Status de sessão inválido '{status}'. Permitidos: {allowed}")
+    if planned_minutes < 0:
+        raise ValueError("planned_minutes deve ser maior ou igual a zero.")
+    if actual_minutes is not None and actual_minutes < 0:
+        raise ValueError("actual_minutes deve ser maior ou igual a zero.")
+
+    planned_at_norm = _normalize_iso_utc(planned_at) if planned_at else None
+    started_at_norm = _normalize_iso_utc(started_at) if started_at else None
+    finished_at_norm = _normalize_iso_utc(finished_at) if finished_at else None
+    created_at_norm = _normalize_iso_utc(created_at)
+
+    cursor = conn.execute(
+        """
+        INSERT INTO study_sessions (
+            user_id, subject, topic, planned_minutes, actual_minutes,
+            planned_at, started_at, finished_at, status, source, notes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            subject,
+            topic,
+            planned_minutes,
+            actual_minutes,
+            planned_at_norm,
+            started_at_norm,
+            finished_at_norm,
+            status,
+            source,
+            notes,
+            created_at_norm,
+        ),
+    )
+    conn.commit()
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def update_study_session(
+    conn: sqlite3.Connection,
+    *,
+    session_id: int,
+    status: str | None = None,
+    actual_minutes: int | None = None,
+    started_at: str | datetime | None = None,
+    finished_at: str | datetime | None = None,
+    notes: str | None = None,
+) -> None:
+    """Atualiza atributos de uma sessão de estudo existente."""
+    existing = conn.execute(
+        "SELECT id FROM study_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if existing is None:
+        raise ValueError(f"Sessão de estudo id {session_id} não encontrada.")
+
+    updates: list[str] = []
+    params: list[Any] = []
+
+    if status is not None:
+        if status not in VALID_SESSION_STATUSES:
+            allowed = sorted(VALID_SESSION_STATUSES)
+            raise ValueError(
+                f"Status de sessão inválido '{status}'. Permitidos: {allowed}"
+            )
+        updates.append("status = ?")
+        params.append(status)
+
+    if actual_minutes is not None:
+        if actual_minutes < 0:
+            raise ValueError("actual_minutes deve ser maior ou igual a zero.")
+        updates.append("actual_minutes = ?")
+        params.append(actual_minutes)
+
+    if started_at is not None:
+        updates.append("started_at = ?")
+        params.append(_normalize_iso_utc(started_at))
+
+    if finished_at is not None:
+        updates.append("finished_at = ?")
+        params.append(_normalize_iso_utc(finished_at))
+
+    if notes is not None:
+        updates.append("notes = ?")
+        params.append(notes)
+
+    if not updates:
+        return
+
+    params.append(session_id)
+    query = f"UPDATE study_sessions SET {', '.join(updates)} WHERE id = ?"
+    conn.execute(query, params)
+    conn.commit()
+
+
+def get_study_session(conn: sqlite3.Connection, session_id: int) -> sqlite3.Row | None:
+    """Retorna uma sessão de estudo pelo ID ou None se não existir."""
+    row = conn.execute(
+        "SELECT * FROM study_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    return cast(sqlite3.Row | None, row)
+
+
+def list_study_sessions(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    subject: str | None = None,
+    status: str | None = None,
+    since: str | datetime | None = None,
+    until: str | datetime | None = None,
+    limit: int | None = None,
+) -> list[sqlite3.Row]:
+    """Lista sessões de estudo com filtros opcionais.
+
+    Ordenadas por planned_at/created_at decrescente.
+    """
+    conditions: list[str] = ["user_id = ?"]
+    params: list[Any] = [user_id]
+
+    if subject is not None:
+        conditions.append("subject = ?")
+        params.append(subject)
+
+    if status is not None:
+        conditions.append("status = ?")
+        params.append(status)
+
+    if since is not None:
+        conditions.append("COALESCE(planned_at, created_at) >= ?")
+        params.append(_normalize_iso_utc(since))
+
+    if until is not None:
+        conditions.append("COALESCE(planned_at, created_at) <= ?")
+        params.append(_normalize_iso_utc(until))
+
+    query = f"""
+        SELECT * FROM study_sessions
+        WHERE {" AND ".join(conditions)}
+        ORDER BY COALESCE(planned_at, created_at) DESC, id DESC
+    """
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+
+    return conn.execute(query, params).fetchall()

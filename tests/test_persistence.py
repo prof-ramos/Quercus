@@ -347,3 +347,94 @@ def test_invalid_memory_parameters_raise_error(conn: sqlite3.Connection) -> None
             event_id=1,
             relationship="invalid",
         )
+
+
+def test_study_sessions_crud_and_ordering(conn: sqlite3.Connection) -> None:
+    session_id = persistence.record_study_session(
+        conn,
+        user_id="cacd_user",
+        subject="História do Brasil",
+        topic="Segundo Reinado",
+        planned_minutes=90,
+        planned_at="2026-09-18T14:00:00Z",
+    )
+    assert session_id > 0
+
+    s = persistence.get_study_session(conn, session_id)
+    assert s is not None
+    assert s["user_id"] == "cacd_user"
+    assert s["subject"] == "História do Brasil"
+    assert s["topic"] == "Segundo Reinado"
+    assert s["planned_minutes"] == 90
+    assert s["actual_minutes"] is None
+    assert s["status"] == "planned"
+    assert s["planned_at"] == "2026-09-18T14:00:00.000000+00:00"
+
+    # Atualiza sessão com início e término
+    persistence.update_study_session(
+        conn,
+        session_id=session_id,
+        status="completed",
+        actual_minutes=95,
+        started_at="2026-09-18T14:02:00Z",
+        finished_at="2026-09-18T15:37:00Z",
+        notes="Capítulos 4 e 5 lidos com fichamento",
+    )
+    updated = persistence.get_study_session(conn, session_id)
+    assert updated is not None
+    assert updated["status"] == "completed"
+    assert updated["actual_minutes"] == 95
+    assert updated["started_at"] == "2026-09-18T14:02:00.000000+00:00"
+    assert updated["finished_at"] == "2026-09-18T15:37:00.000000+00:00"
+    assert updated["notes"] == "Capítulos 4 e 5 lidos com fichamento"
+
+    # Segunda sessão para testar ordenação e listagem
+    persistence.record_study_session(
+        conn,
+        user_id="cacd_user",
+        subject="Política Internacional",
+        topic="Consenso de Washington",
+        planned_minutes=60,
+        planned_at="2026-09-19T10:00:00Z",
+    )
+
+    sessions = persistence.list_study_sessions(conn, user_id="cacd_user")
+    assert len(sessions) == 2
+    # Mais recente primeiro
+    assert sessions[0]["subject"] == "Política Internacional"
+    assert sessions[1]["subject"] == "História do Brasil"
+
+    # Filtro por subject
+    pi_sessions = persistence.list_study_sessions(
+        conn, user_id="cacd_user", subject="Política Internacional"
+    )
+    assert len(pi_sessions) == 1
+    assert pi_sessions[0]["topic"] == "Consenso de Washington"
+
+
+def test_study_sessions_validation_errors(conn: sqlite3.Connection) -> None:
+    with pytest.raises(ValueError, match="Status de sessão inválido"):
+        persistence.record_study_session(
+            conn,
+            user_id="u",
+            subject="PI",
+            planned_minutes=30,
+            status="flying",
+        )
+
+    with pytest.raises(
+        ValueError, match="planned_minutes deve ser maior ou igual a zero"
+    ):
+        persistence.record_study_session(
+            conn,
+            user_id="u",
+            subject="PI",
+            planned_minutes=-10,
+        )
+
+    with pytest.raises(ValueError, match="Sessão de estudo id 999 não encontrada"):
+        persistence.update_study_session(
+            conn,
+            session_id=999,
+            status="completed",
+        )
