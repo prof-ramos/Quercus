@@ -11,6 +11,8 @@ env/
 
 # Test / build
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 *.egg-info/
