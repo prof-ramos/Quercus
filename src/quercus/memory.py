@@ -240,3 +240,42 @@ def supersede_preference(
         relationship="supports",
     )
     return new_mem_id
+
+
+def explain_memory_provenance(conn: sqlite3.Connection, memory_id: int) -> str:
+    """Responde à pergunta 'Por que você acha isso sobre mim?'.
+
+    Retorna justificativa transparente ancorada nas evidências
+    da tabela memory_evidence.
+    """
+    mem = persistence.get_memory_with_evidence(conn, memory_id)
+    if mem is None:
+        raise ValueError(f"Memória id {memory_id} não encontrada.")
+
+    statement = mem["statement"]
+    status = mem["status"]
+    conf = mem["confidence"]
+    conf_str = f"{int(conf * 100)}%" if conf is not None else "N/A"
+    origin = mem["source_origin"]
+    created_date = mem["created_at"][:10]
+
+    lines = [
+        f'Memória: "{statement}"',
+        f"Status: {status} | Confiança: {conf_str} | Origem: {origin}",
+        f"Criada em: {created_date}",
+        "",
+        "Evidências probatórias:",
+    ]
+
+    evidences = mem.get("evidence", [])
+    if not evidences:
+        lines.append("- Nenhuma evidência de evento vinculada.")
+    else:
+        for ev in evidences:
+            ev_date = ev["event_timestamp"][:10] if ev["event_timestamp"] else "N/A"
+            rel = ev["relationship"]
+            ev_type = ev["event_type"]
+            src = ev["source_type"]
+            lines.append(f"- [{ev_date}] {ev_type} ({src}) — relação: {rel}")
+
+    return "\n".join(lines)
