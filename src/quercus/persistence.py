@@ -5,7 +5,9 @@ SQLite local; sem ORM. `events` é append-only: não há mutators expostos.
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import Any
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -18,17 +20,95 @@ CREATE TABLE IF NOT EXISTS events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    memory_type TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    status TEXT NOT NULL,
+    confidence REAL,
+    importance INTEGER DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    last_confirmed_at TEXT,
+    expires_at TEXT,
+    supersedes_id INTEGER,
+    source_origin TEXT NOT NULL,
+    FOREIGN KEY(supersedes_id) REFERENCES memories(id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_evidence (
+    id INTEGER PRIMARY KEY,
+    memory_id INTEGER NOT NULL,
+    event_id INTEGER NOT NULL,
+    weight REAL DEFAULT 1.0,
+    relationship TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+    FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE RESTRICT
+);
 """
 
+VALID_SOURCE_TYPES: frozenset[str] = frozenset(
+    {
+        "USER_EXPLICIT",
+        "USER_OBSERVED",
+        "SYSTEM_OBSERVED",
+        "AGENT_DERIVED",
+        "DOCUMENT_TRUSTED",
+        "DOCUMENT_UNTRUSTED",
+        "TOOL_RESULT",
+    }
+)
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+VALID_MEMORY_TYPES: frozenset[str] = frozenset(
+    {"episodic", "semantic", "inferential", "procedural"}
+)
+
+VALID_MEMORY_STATUSES: frozenset[str] = frozenset(
+    {
+        "candidate",
+        "active",
+        "superseded",
+        "archived",
+        "rejected",
+        "revoked",
+        "expired",
+    }
+)
+
+VALID_EVIDENCE_RELATIONSHIPS: frozenset[str] = frozenset(
+    {"supports", "contradicts", "illustrates"}
+)
+
+
+def _normalize_iso_utc(ts: str | datetime | None = None) -> str:
+    """Retorna timestamp ISO-8601 em UTC rigoroso com microssegundos.
+
+    Exemplo de saída: '2026-09-18T20:30:00.000000+00:00'.
+    Garante ordenação léxica idêntica à ordem cronológica no SQLite TEXT.
+    """
+    if ts is None:
+        dt = datetime.now(UTC)
+    elif isinstance(ts, datetime):
+        dt = ts.astimezone(UTC) if ts.tzinfo else ts.replace(tzinfo=UTC)
+    elif isinstance(ts, str):
+        clean = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(clean)
+        dt = dt.astimezone(UTC) if dt.tzinfo else dt.replace(tzinfo=UTC)
+    else:
+        raise TypeError(f"Timestamp inválido: {type(ts)}")
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
 
 
 def connect(path: str) -> sqlite3.Connection:
-    """Abre conexão e garante o schema."""
+    """Abre conexão, ativa WAL/busy_timeout, foreign_keys e garante o schema."""
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    conn.execute("PRAGMA foreign_keys = ON;")
     conn.executescript(SCHEMA)
     return conn
 
@@ -38,29 +118,41 @@ def record_event(
     *,
     user_id: str,
     event_type: str,
-    payload: dict,
+    payload: Mapping[str, Any],
     source_type: str = "SYSTEM_OBSERVED",
     source_id: str | None = None,
-    timestamp: str | None = None,
+    timestamp: str | datetime | None = None,
 ) -> int:
     """Registra um evento. Retorna o id."""
+    if source_type not in VALID_SOURCE_TYPES:
+        raise ValueError(
+            f"source_type '{source_type}' inválido. "
+            f"Origens permitidas: {sorted(VALID_SOURCE_TYPES)}"
+        )
+
+    norm_timestamp = _normalize_iso_utc(timestamp)
+    created_at = _normalize_iso_utc()
+    payload_json = json.dumps(payload, ensure_ascii=False, default=str)
+
     cur = conn.execute(
         """
         INSERT INTO events
-            (user_id, event_type, timestamp, source_type, source_id, payload_json, created_at)
+            (user_id, event_type, timestamp, source_type, source_id,
+             payload_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (
             user_id,
             event_type,
-            timestamp or _now(),
+            norm_timestamp,
             source_type,
             source_id,
-            json.dumps(payload, ensure_ascii=False),
-            _now(),
+            payload_json,
+            created_at,
         ),
     )
     conn.commit()
+    assert cur.lastrowid is not None
     return cur.lastrowid
 
 
@@ -82,3 +174,233 @@ def list_events(
         """,
         (user_id, limit),
     ).fetchall()
+
+
+def record_memory(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    memory_type: str,
+    statement: str,
+    status: str = "candidate",
+    confidence: float | None = None,
+    importance: int = 1,
+    source_origin: str = "SYSTEM_OBSERVED",
+    supersedes_id: int | None = None,
+    created_at: str | datetime | None = None,
+) -> int:
+    """Registra uma memória (candidata ou ativa). Retorna o id."""
+    if memory_type not in VALID_MEMORY_TYPES:
+        raise ValueError(
+            f"memory_type '{memory_type}' inválido. "
+            f"Tipos permitidos: {sorted(VALID_MEMORY_TYPES)}"
+        )
+    if status not in VALID_MEMORY_STATUSES:
+        raise ValueError(
+            f"status '{status}' inválido. "
+            f"Status permitidos: {sorted(VALID_MEMORY_STATUSES)}"
+        )
+    if source_origin not in VALID_SOURCE_TYPES:
+        raise ValueError(
+            f"source_origin '{source_origin}' inválido. "
+            f"Origens permitidas: {sorted(VALID_SOURCE_TYPES)}"
+        )
+
+    norm_created_at = _normalize_iso_utc(created_at)
+    cur = conn.execute(
+        """
+        INSERT INTO memories
+            (user_id, memory_type, statement, status, confidence, importance,
+             created_at, updated_at, last_confirmed_at, expires_at,
+             supersedes_id, source_origin)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            memory_type,
+            statement,
+            status,
+            confidence,
+            importance,
+            norm_created_at,
+            norm_created_at,
+            None,
+            None,
+            supersedes_id,
+            source_origin,
+        ),
+    )
+    conn.commit()
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def link_memory_evidence(
+    conn: sqlite3.Connection,
+    *,
+    memory_id: int,
+    event_id: int,
+    weight: float = 1.0,
+    relationship: str = "supports",
+) -> int:
+    """Vincula um evento como evidência para uma memória."""
+    if relationship not in VALID_EVIDENCE_RELATIONSHIPS:
+        raise ValueError(
+            f"relationship '{relationship}' inválido. "
+            f"Relações permitidas: {sorted(VALID_EVIDENCE_RELATIONSHIPS)}"
+        )
+    created_at = _normalize_iso_utc()
+    cur = conn.execute(
+        """
+        INSERT INTO memory_evidence
+            (memory_id, event_id, weight, relationship, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (memory_id, event_id, weight, relationship, created_at),
+    )
+    conn.commit()
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def list_memories(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    status: str | None = None,
+    memory_type: str | None = None,
+    limit: int = 100,
+) -> list[sqlite3.Row]:
+    """Lê memórias do usuário com filtros opcionais por status e tipo."""
+    query = """
+        SELECT id, user_id, memory_type, statement, status, confidence,
+               importance, created_at, updated_at, last_confirmed_at,
+               expires_at, supersedes_id, source_origin
+        FROM memories
+        WHERE user_id = ?
+    """
+    params: list[Any] = [user_id]
+    if status is not None:
+        query += " AND status = ?"
+        params.append(status)
+    if memory_type is not None:
+        query += " AND memory_type = ?"
+        params.append(memory_type)
+
+    query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    params.append(limit)
+    return conn.execute(query, params).fetchall()
+
+
+def get_memory_with_evidence(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> dict[str, Any] | None:
+    """Recupera memória com sua cadeia de evidências para auditabilidade."""
+    row = conn.execute(
+        """
+        SELECT id, user_id, memory_type, statement, status, confidence,
+               importance, created_at, updated_at, last_confirmed_at,
+               expires_at, supersedes_id, source_origin
+        FROM memories
+        WHERE id = ?
+        """,
+        (memory_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    mem_dict: dict[str, Any] = dict(row)
+    evidence_rows = conn.execute(
+        """
+        SELECT me.id, me.memory_id, me.event_id, me.weight, me.relationship,
+               me.created_at, e.event_type, e.timestamp as event_timestamp,
+               e.source_type, e.payload_json
+        FROM memory_evidence me
+        JOIN events e ON me.event_id = e.id
+        WHERE me.memory_id = ?
+        ORDER BY me.id ASC
+        """,
+        (memory_id,),
+    ).fetchall()
+
+    evidences: list[dict[str, Any]] = []
+    for ev in evidence_rows:
+        d = dict(ev)
+        d["payload"] = json.loads(d.pop("payload_json"))
+        evidences.append(d)
+
+    mem_dict["evidence"] = evidences
+    return mem_dict
+
+
+def update_memory_status(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    *,
+    status: str,
+    confidence: float | None = None,
+) -> None:
+    """Atualiza status e opcionalmente a confiança de uma memória."""
+    if status not in VALID_MEMORY_STATUSES:
+        raise ValueError(
+            f"status '{status}' inválido. "
+            f"Status permitidos: {sorted(VALID_MEMORY_STATUSES)}"
+        )
+    updated_at = _normalize_iso_utc()
+    if confidence is not None:
+        conn.execute(
+            """
+            UPDATE memories
+            SET status = ?, confidence = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, confidence, updated_at, memory_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE memories
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, updated_at, memory_id),
+        )
+    conn.commit()
+
+
+def supersede_memory(
+    conn: sqlite3.Connection,
+    *,
+    old_memory_id: int,
+    statement: str,
+    confidence: float | None = None,
+    importance: int = 1,
+    source_origin: str = "USER_EXPLICIT",
+) -> int:
+    """Substitui uma memória por outra mantendo a trilha de auditoria."""
+    old = conn.execute(
+        "SELECT user_id, memory_type FROM memories WHERE id = ?",
+        (old_memory_id,),
+    ).fetchone()
+    if old is None:
+        raise ValueError(f"Memória id {old_memory_id} não encontrada.")
+
+    updated_at = _normalize_iso_utc()
+    conn.execute(
+        "UPDATE memories SET status = 'superseded', updated_at = ? WHERE id = ?",
+        (updated_at, old_memory_id),
+    )
+
+    return record_memory(
+        conn,
+        user_id=old["user_id"],
+        memory_type=old["memory_type"],
+        statement=statement,
+        status="active",
+        confidence=confidence,
+        importance=importance,
+        source_origin=source_origin,
+        supersedes_id=old_memory_id,
+        created_at=updated_at,
+    )
