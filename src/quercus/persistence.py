@@ -64,6 +64,32 @@ CREATE TABLE IF NOT EXISTS study_sessions (
     notes TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS study_plans (
+    id INTEGER PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    plan_date TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS study_plan_items (
+    id INTEGER PRIMARY KEY,
+    plan_id INTEGER NOT NULL,
+    subject TEXT NOT NULL,
+    topic TEXT,
+    duration_minutes INTEGER NOT NULL,
+    priority INTEGER DEFAULT 1,
+    deadline TEXT,
+    reason TEXT,
+    status TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(plan_id) REFERENCES study_plans(id) ON DELETE CASCADE
+);
 """
 
 VALID_SOURCE_TYPES: frozenset[str] = frozenset(
@@ -84,6 +110,27 @@ VALID_SESSION_STATUSES: frozenset[str] = frozenset(
         "completed",
         "partial",
         "skipped",
+        "cancelled",
+    }
+)
+
+VALID_PLAN_STATUSES: frozenset[str] = frozenset(
+    {
+        "draft",
+        "active",
+        "adapted",
+        "completed",
+        "cancelled",
+    }
+)
+
+VALID_PLAN_ITEM_STATUSES: frozenset[str] = frozenset(
+    {
+        "pending",
+        "in_progress",
+        "completed",
+        "deferred",
+        "reduced",
         "cancelled",
     }
 )
@@ -599,3 +646,172 @@ def list_study_sessions(
         params.append(limit)
 
     return conn.execute(query, params).fetchall()
+
+
+def record_study_plan(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    plan_date: str,
+    title: str,
+    status: str = "active",
+    notes: str | None = None,
+    created_at: str | datetime | None = None,
+) -> int:
+    """Registra um plano diário de estudo."""
+    if status not in VALID_PLAN_STATUSES:
+        allowed = sorted(VALID_PLAN_STATUSES)
+        raise ValueError(f"Status de plano inválido '{status}'. Permitidos: {allowed}")
+    created_norm = _normalize_iso_utc(created_at)
+    cursor = conn.execute(
+        """
+        INSERT INTO study_plans (
+            user_id, plan_date, title, status, notes, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (user_id, plan_date, title, status, notes, created_norm, created_norm),
+    )
+    conn.commit()
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def add_study_plan_item(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: int,
+    subject: str,
+    duration_minutes: int,
+    topic: str | None = None,
+    priority: int = 1,
+    deadline: str | datetime | None = None,
+    reason: str | None = None,
+    status: str = "pending",
+    source: str = "AGENT_PROPOSED",
+    created_at: str | datetime | None = None,
+) -> int:
+    """Adiciona um item estruturado a um plano de estudo."""
+    if status not in VALID_PLAN_ITEM_STATUSES:
+        allowed = sorted(VALID_PLAN_ITEM_STATUSES)
+        raise ValueError(f"Status de item inválido '{status}'. Permitidos: {allowed}")
+    if duration_minutes <= 0:
+        raise ValueError("duration_minutes deve ser maior que zero.")
+
+    plan = conn.execute(
+        "SELECT id FROM study_plans WHERE id = ?", (plan_id,)
+    ).fetchone()
+    if plan is None:
+        raise ValueError(f"Plano id {plan_id} não encontrado.")
+
+    deadline_norm = _normalize_iso_utc(deadline) if deadline else None
+    created_norm = _normalize_iso_utc(created_at)
+
+    cursor = conn.execute(
+        """
+        INSERT INTO study_plan_items (
+            plan_id, subject, topic, duration_minutes, priority,
+            deadline, reason, status, source, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            plan_id,
+            subject,
+            topic,
+            duration_minutes,
+            priority,
+            deadline_norm,
+            reason,
+            status,
+            source,
+            created_norm,
+        ),
+    )
+    conn.commit()
+    assert cursor.lastrowid is not None
+    return int(cursor.lastrowid)
+
+
+def get_study_plan(conn: sqlite3.Connection, plan_id: int) -> dict[str, Any] | None:
+    """Recupera um plano e seus itens ordenados por prioridade."""
+    row = conn.execute("SELECT * FROM study_plans WHERE id = ?", (plan_id,)).fetchone()
+    if row is None:
+        return None
+    plan_dict: dict[str, Any] = dict(row)
+    items = conn.execute(
+        """
+        SELECT * FROM study_plan_items
+        WHERE plan_id = ?
+        ORDER BY priority ASC, id ASC
+        """,
+        (plan_id,),
+    ).fetchall()
+    plan_dict["items"] = [dict(it) for it in items]
+    return plan_dict
+
+
+def list_study_plans(
+    conn: sqlite3.Connection,
+    *,
+    user_id: str,
+    plan_date: str | None = None,
+    status: str | None = None,
+    limit: int = 100,
+) -> list[sqlite3.Row]:
+    """Lista planos de estudo com filtros opcionais."""
+    conditions: list[str] = ["user_id = ?"]
+    params: list[Any] = [user_id]
+    if plan_date is not None:
+        conditions.append("plan_date = ?")
+        params.append(plan_date)
+    if status is not None:
+        conditions.append("status = ?")
+        params.append(status)
+    query = f"""
+        SELECT * FROM study_plans
+        WHERE {" AND ".join(conditions)}
+        ORDER BY plan_date DESC, id DESC LIMIT ?
+    """
+    params.append(limit)
+    return conn.execute(query, params).fetchall()
+
+
+def update_plan_item_status(
+    conn: sqlite3.Connection,
+    *,
+    item_id: int,
+    status: str,
+    duration_minutes: int | None = None,
+    reason: str | None = None,
+) -> None:
+    """Atualiza o status ou duração de um item do plano."""
+    if status not in VALID_PLAN_ITEM_STATUSES:
+        allowed = sorted(VALID_PLAN_ITEM_STATUSES)
+        raise ValueError(f"Status de item inválido '{status}'. Permitidos: {allowed}")
+    existing = conn.execute(
+        "SELECT id, plan_id FROM study_plan_items WHERE id = ?", (item_id,)
+    ).fetchone()
+    if existing is None:
+        raise ValueError(f"Item de plano id {item_id} não encontrado.")
+
+    updates = ["status = ?"]
+    params: list[Any] = [status]
+    if duration_minutes is not None:
+        if duration_minutes <= 0:
+            raise ValueError("duration_minutes deve ser maior que zero.")
+        updates.append("duration_minutes = ?")
+        params.append(duration_minutes)
+    if reason is not None:
+        updates.append("reason = ?")
+        params.append(reason)
+
+    params.append(item_id)
+    conn.execute(
+        f"UPDATE study_plan_items SET {', '.join(updates)} WHERE id = ?",
+        params,
+    )
+    now_iso = _normalize_iso_utc()
+    conn.execute(
+        "UPDATE study_plans SET updated_at = ? WHERE id = ?",
+        (now_iso, existing["plan_id"]),
+    )
+    conn.commit()
